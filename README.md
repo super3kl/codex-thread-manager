@@ -15,6 +15,7 @@ Sync, inspect, repair, and clean Codex threads across providers from a macOS men
 ## GitHub 快速信息
 
 - 推荐仓库名：`codex-thread-manager`
+- License：`MIT`
 - GitHub 简介：
   `A macOS menu bar app and Rust CLI for syncing, inspecting, repairing, and cleaning Codex threads across providers.`
 - 一句话 tagline：
@@ -181,3 +182,7 @@ cargo test --manifest-path rust/codex_thread_manager/Cargo.toml
 swift build --disable-sandbox -c release
 cargo test --manifest-path rust/codex_thread_manager/Cargo.toml
 ```
+
+## License
+
+MIT

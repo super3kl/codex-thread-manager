@@ -6,6 +6,10 @@
 
 `codex-thread-manager`
 
+## License
+
+`MIT`
+
 ## GitHub 简介
 
 ### 推荐英文版
