@@ -1,0 +1,12 @@
+.DS_Store
+
+.build/
+.swift-build/
+
+rust/*/target/
+
+*.app
+*.dSYM
+
+.codex-db-backups/
+*.log
