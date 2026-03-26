@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- 菜单栏内支持“同步指定 provider...”，可按勾选的 provider 集合同步
+- Rust CLI 新增 `sync-selected` 命令
+
+### Changed
+
+- 菜单栏同步区只保留“同步全部 provider”和“同步指定 provider...”
+- 删除 `openai/cpa` 的快捷同步按钮，减少重复入口
+- 重写 README，并更新 GitHub Launch Kit 文案
+- 清理菜单栏运行路径中的 Swift 并发 warning
+
 ## v0.1.0
 
 首个可公开发布版本。
