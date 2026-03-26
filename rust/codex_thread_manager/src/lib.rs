@@ -348,7 +348,12 @@ impl ThreadRecord {
 }
 
 impl CodexSyncEngine {
-    pub fn new(codex_home: PathBuf, state_path: PathBuf, backup_root: PathBuf, log_path: PathBuf) -> Self {
+    pub fn new(
+        codex_home: PathBuf,
+        state_path: PathBuf,
+        backup_root: PathBuf,
+        log_path: PathBuf,
+    ) -> Self {
         Self {
             db_path: codex_home.join("state_5.sqlite"),
             session_index_path: codex_home.join("session_index.jsonl"),
@@ -375,7 +380,9 @@ impl CodexSyncEngine {
         let pair_links = state
             .links
             .iter()
-            .filter(|link| link.providers.contains_key(provider_a) && link.providers.contains_key(provider_b))
+            .filter(|link| {
+                link.providers.contains_key(provider_a) && link.providers.contains_key(provider_b)
+            })
             .count() as i64;
 
         Ok(StatusResult {
@@ -592,7 +599,68 @@ impl CodexSyncEngine {
         Ok(result)
     }
 
-    pub fn sync(&self, source_provider: &str, target_provider: &str, dry_run: bool) -> Result<DirectionalResult> {
+    pub fn sync_selected(
+        &self,
+        requested_providers: &[String],
+        dry_run: bool,
+    ) -> Result<MeshSyncResult> {
+        let conn = self.connect()?;
+        let counts = self.provider_counts(&conn)?;
+        let threads = self.load_threads(&conn)?;
+        let selected_providers = resolve_selected_providers(requested_providers, &counts)?;
+
+        let bootstrap =
+            self.bootstrap_mesh_links(self.load_state()?, &threads, &selected_providers);
+        let adopted = bootstrap.adopted.clone();
+        let mut state = bootstrap.state;
+        let operations =
+            self.plan_selected_mesh_operations(&state, &threads, &selected_providers, &adopted);
+        let planned = summarize_mesh_operations(&operations);
+        let current_status = self.status_all()?;
+
+        if dry_run {
+            return Ok(MeshSyncResult {
+                mode: "mesh-selected".to_string(),
+                dry_run,
+                providers: selected_providers,
+                planned,
+                applied: None,
+                backup_dir: None,
+                final_status: current_status,
+            });
+        }
+
+        let touched_paths = collect_mesh_backup_paths(&operations);
+        let backup_dir = self.create_backup(
+            &format!("sync-selected-{}", selected_providers.join("-")),
+            &touched_paths,
+        )?;
+        let applied = self.apply_mesh_operations(&conn, &mut state, operations)?;
+        self.save_state(&state)?;
+        let final_status = self.status_all()?;
+
+        let result = MeshSyncResult {
+            mode: "mesh-selected".to_string(),
+            dry_run,
+            providers: selected_providers,
+            planned,
+            applied: Some(applied),
+            backup_dir: Some(backup_dir.display().to_string()),
+            final_status,
+        };
+        self.log_info(&format!(
+            "selected mesh sync finished: {}",
+            serde_json::to_string(&result).unwrap_or_else(|_| "\"serialize-error\"".to_string())
+        ));
+        Ok(result)
+    }
+
+    pub fn sync(
+        &self,
+        source_provider: &str,
+        target_provider: &str,
+        dry_run: bool,
+    ) -> Result<DirectionalResult> {
         if source_provider == target_provider {
             bail!("source 和 target 不能相同");
         }
@@ -609,8 +677,13 @@ impl CodexSyncEngine {
             Some(&source_threads),
             Some(&target_threads),
         );
-        let (operations, mut state) =
-            self.plan_operations(state, source_provider, target_provider, &source_threads, &target_threads);
+        let (operations, mut state) = self.plan_operations(
+            state,
+            source_provider,
+            target_provider,
+            &source_threads,
+            &target_threads,
+        );
 
         let mut summary = DirectionalResult {
             mode: "directional".to_string(),
@@ -633,7 +706,13 @@ impl CodexSyncEngine {
             &format!("{source_provider}-to-{target_provider}"),
             &touched_paths,
         )?;
-        let applied = self.apply_operations(&conn, &mut state, source_provider, target_provider, operations)?;
+        let applied = self.apply_operations(
+            &conn,
+            &mut state,
+            source_provider,
+            target_provider,
+            operations,
+        )?;
         summary.backup_dir = Some(backup_dir.display().to_string());
         summary.applied = Some(applied);
         summary.status = Some(self.provider_counts(&conn)?);
@@ -657,11 +736,14 @@ impl CodexSyncEngine {
     }
 
     fn load_state(&self) -> Result<SyncState> {
-        load_json_file(&self.state_path, SyncState {
-            version: 1,
-            links: Vec::new(),
-            extra: BTreeMap::new(),
-        })
+        load_json_file(
+            &self.state_path,
+            SyncState {
+                version: 1,
+                links: Vec::new(),
+                extra: BTreeMap::new(),
+            },
+        )
     }
 
     fn save_state(&self, state: &SyncState) -> Result<()> {
@@ -676,7 +758,9 @@ impl CodexSyncEngine {
              group by trim(model_provider) \
              order by trim(model_provider)",
         )?;
-        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
         let mut counts = BTreeMap::new();
         for row in rows {
             let (provider, count) = row?;
@@ -685,7 +769,10 @@ impl CodexSyncEngine {
         Ok(counts)
     }
 
-    fn load_threads(&self, conn: &Connection) -> Result<BTreeMap<String, BTreeMap<String, ThreadRecord>>> {
+    fn load_threads(
+        &self,
+        conn: &Connection,
+    ) -> Result<BTreeMap<String, BTreeMap<String, ThreadRecord>>> {
         let sql = format!("select {} from threads", THREAD_COLUMNS.join(","));
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([], map_thread_row)?;
@@ -735,7 +822,11 @@ impl CodexSyncEngine {
                 let target_thread = link
                     .providers
                     .get(provider)
-                    .and_then(|thread_id| threads.get(provider).and_then(|bucket| bucket.get(thread_id)))
+                    .and_then(|thread_id| {
+                        threads
+                            .get(provider)
+                            .and_then(|bucket| bucket.get(thread_id))
+                    })
                     .cloned();
 
                 let kind = match &target_thread {
@@ -745,7 +836,9 @@ impl CodexSyncEngine {
                             .synced_target_thread(&winner, target_thread, provider)
                             .rollout_path
                             != target_thread.rollout_path;
-                        if target_thread.id == winner.id && target_thread.model_provider == winner.model_provider {
+                        if target_thread.id == winner.id
+                            && target_thread.model_provider == winner.model_provider
+                        {
                             if rollout_path_mismatch {
                                 MeshOperationKind::Update
                             } else if !rollout_permissions_match(target_thread) {
@@ -758,7 +851,90 @@ impl CodexSyncEngine {
                             thread_id: target_thread.id.clone(),
                         }) {
                             MeshOperationKind::Adopt
-                        } else if target_thread.fingerprint_key() != winner.fingerprint_key() || rollout_path_mismatch {
+                        } else if target_thread.fingerprint_key() != winner.fingerprint_key()
+                            || rollout_path_mismatch
+                        {
+                            MeshOperationKind::Update
+                        } else if !rollout_permissions_match(target_thread) {
+                            MeshOperationKind::Repair
+                        } else {
+                            MeshOperationKind::Skip
+                        }
+                    }
+                };
+
+                operations.push(MeshOperation {
+                    kind,
+                    winner_thread: winner.clone(),
+                    target_provider: provider.clone(),
+                    target_thread,
+                    link_index,
+                });
+            }
+        }
+
+        operations
+    }
+
+    fn plan_selected_mesh_operations(
+        &self,
+        state: &SyncState,
+        threads: &BTreeMap<String, BTreeMap<String, ThreadRecord>>,
+        providers: &[String],
+        adopted: &BTreeSet<ThreadLocator>,
+    ) -> Vec<MeshOperation> {
+        let selected_providers: BTreeSet<_> = providers.iter().cloned().collect();
+        let mut operations = Vec::new();
+
+        for (link_index, link) in state.links.iter().enumerate() {
+            if !providers
+                .iter()
+                .any(|provider| link.providers.contains_key(provider))
+            {
+                continue;
+            }
+            let Some(winner) =
+                select_authoritative_thread_for_providers(link, threads, &selected_providers)
+            else {
+                continue;
+            };
+
+            for provider in providers {
+                let target_thread = link
+                    .providers
+                    .get(provider)
+                    .and_then(|thread_id| {
+                        threads
+                            .get(provider)
+                            .and_then(|bucket| bucket.get(thread_id))
+                    })
+                    .cloned();
+
+                let kind = match &target_thread {
+                    None => MeshOperationKind::Create,
+                    Some(target_thread) => {
+                        let rollout_path_mismatch = self
+                            .synced_target_thread(&winner, target_thread, provider)
+                            .rollout_path
+                            != target_thread.rollout_path;
+                        if target_thread.id == winner.id
+                            && target_thread.model_provider == winner.model_provider
+                        {
+                            if rollout_path_mismatch {
+                                MeshOperationKind::Update
+                            } else if !rollout_permissions_match(target_thread) {
+                                MeshOperationKind::Repair
+                            } else {
+                                MeshOperationKind::Skip
+                            }
+                        } else if adopted.contains(&ThreadLocator {
+                            provider: provider.clone(),
+                            thread_id: target_thread.id.clone(),
+                        }) {
+                            MeshOperationKind::Adopt
+                        } else if target_thread.fingerprint_key() != winner.fingerprint_key()
+                            || rollout_path_mismatch
+                        {
                             MeshOperationKind::Update
                         } else if !rollout_permissions_match(target_thread) {
                             MeshOperationKind::Repair
@@ -840,7 +1016,10 @@ impl CodexSyncEngine {
                     .rollout_path
                     != target_thread.rollout_path;
                 let target_needs_repair = !rollout_permissions_match(&target_thread);
-                let kind = if source_thread.updated_at > target_thread.updated_at || fingerprint_differs || rollout_path_mismatch {
+                let kind = if source_thread.updated_at > target_thread.updated_at
+                    || fingerprint_differs
+                    || rollout_path_mismatch
+                {
                     OperationKind::Update
                 } else if target_needs_repair {
                     OperationKind::Repair
@@ -919,7 +1098,10 @@ impl CodexSyncEngine {
         drop(backup);
 
         if self.session_index_path.exists() {
-            fs::copy(&self.session_index_path, backup_dir.join("session_index.jsonl"))?;
+            fs::copy(
+                &self.session_index_path,
+                backup_dir.join("session_index.jsonl"),
+            )?;
         }
         if self.global_state_path.exists() {
             fs::copy(
@@ -928,7 +1110,10 @@ impl CodexSyncEngine {
             )?;
         }
         if self.state_path.exists() {
-            fs::copy(&self.state_path, backup_dir.join("provider_sync_state.json"))?;
+            fs::copy(
+                &self.state_path,
+                backup_dir.join("provider_sync_state.json"),
+            )?;
         }
 
         let archive_path = backup_dir.join("rollouts.tar.gz");
@@ -968,8 +1153,11 @@ impl CodexSyncEngine {
                         continue;
                     }
                     OperationKind::Create => {
-                        let target_thread =
-                            self.create_target_thread(conn, &operation.source_thread, target_provider)?;
+                        let target_thread = self.create_target_thread(
+                            conn,
+                            &operation.source_thread,
+                            target_provider,
+                        )?;
                         created_rollout_paths.push(PathBuf::from(&target_thread.rollout_path));
                         self.update_link(
                             state,
@@ -980,7 +1168,11 @@ impl CodexSyncEngine {
                             &target_thread,
                         );
                         upsert_session_index_entry(&mut session_index, &target_thread)?;
-                        copy_workspace_hint(&mut global_state, &operation.source_thread.id, &target_thread.id);
+                        copy_workspace_hint(
+                            &mut global_state,
+                            &operation.source_thread.id,
+                            &target_thread.id,
+                        );
                         summary.create += 1;
                     }
                     OperationKind::Adopt => {
@@ -1008,7 +1200,11 @@ impl CodexSyncEngine {
                             &synced_thread,
                         );
                         upsert_session_index_entry(&mut session_index, &synced_thread)?;
-                        copy_workspace_hint(&mut global_state, &operation.source_thread.id, &target_thread.id);
+                        copy_workspace_hint(
+                            &mut global_state,
+                            &operation.source_thread.id,
+                            &target_thread.id,
+                        );
                         summary.adopt += 1;
                     }
                     OperationKind::Update => {
@@ -1036,7 +1232,11 @@ impl CodexSyncEngine {
                             &synced_thread,
                         );
                         upsert_session_index_entry(&mut session_index, &synced_thread)?;
-                        copy_workspace_hint(&mut global_state, &operation.source_thread.id, &target_thread.id);
+                        copy_workspace_hint(
+                            &mut global_state,
+                            &operation.source_thread.id,
+                            &target_thread.id,
+                        );
                         summary.update += 1;
                     }
                     OperationKind::Repair => {
@@ -1054,7 +1254,11 @@ impl CodexSyncEngine {
                             target_thread,
                         );
                         upsert_session_index_entry(&mut session_index, target_thread)?;
-                        copy_workspace_hint(&mut global_state, &operation.source_thread.id, &target_thread.id);
+                        copy_workspace_hint(
+                            &mut global_state,
+                            &operation.source_thread.id,
+                            &target_thread.id,
+                        );
                         summary.repair += 1;
                     }
                 }
@@ -1095,14 +1299,25 @@ impl CodexSyncEngine {
                         summary.skip += 1;
                     }
                     MeshOperationKind::Create => {
-                        let target_thread =
-                            self.create_target_thread(conn, &operation.winner_thread, &operation.target_provider)?;
+                        let target_thread = self.create_target_thread(
+                            conn,
+                            &operation.winner_thread,
+                            &operation.target_provider,
+                        )?;
                         created_rollout_paths.push(PathBuf::from(&target_thread.rollout_path));
-                        self.upsert_link_thread(state, operation.link_index, &operation.winner_thread);
+                        self.upsert_link_thread(
+                            state,
+                            operation.link_index,
+                            &operation.winner_thread,
+                        );
                         self.upsert_link_thread(state, operation.link_index, &target_thread);
                         self.touch_link_synced_at(state, operation.link_index);
                         upsert_session_index_entry(&mut session_index, &target_thread)?;
-                        copy_workspace_hint(&mut global_state, &operation.winner_thread.id, &target_thread.id);
+                        copy_workspace_hint(
+                            &mut global_state,
+                            &operation.winner_thread.id,
+                            &target_thread.id,
+                        );
                         summary.create += 1;
                     }
                     MeshOperationKind::Adopt => {
@@ -1121,11 +1336,19 @@ impl CodexSyncEngine {
                             target_thread,
                             &operation.target_provider,
                         )?;
-                        self.upsert_link_thread(state, operation.link_index, &operation.winner_thread);
+                        self.upsert_link_thread(
+                            state,
+                            operation.link_index,
+                            &operation.winner_thread,
+                        );
                         self.upsert_link_thread(state, operation.link_index, &synced_thread);
                         self.touch_link_synced_at(state, operation.link_index);
                         upsert_session_index_entry(&mut session_index, &synced_thread)?;
-                        copy_workspace_hint(&mut global_state, &operation.winner_thread.id, &target_thread.id);
+                        copy_workspace_hint(
+                            &mut global_state,
+                            &operation.winner_thread.id,
+                            &target_thread.id,
+                        );
                         summary.adopt += 1;
                     }
                     MeshOperationKind::Update => {
@@ -1144,11 +1367,19 @@ impl CodexSyncEngine {
                             target_thread,
                             &operation.target_provider,
                         )?;
-                        self.upsert_link_thread(state, operation.link_index, &operation.winner_thread);
+                        self.upsert_link_thread(
+                            state,
+                            operation.link_index,
+                            &operation.winner_thread,
+                        );
                         self.upsert_link_thread(state, operation.link_index, &synced_thread);
                         self.touch_link_synced_at(state, operation.link_index);
                         upsert_session_index_entry(&mut session_index, &synced_thread)?;
-                        copy_workspace_hint(&mut global_state, &operation.winner_thread.id, &target_thread.id);
+                        copy_workspace_hint(
+                            &mut global_state,
+                            &operation.winner_thread.id,
+                            &target_thread.id,
+                        );
                         summary.update += 1;
                     }
                     MeshOperationKind::Repair => {
@@ -1157,11 +1388,19 @@ impl CodexSyncEngine {
                             .as_ref()
                             .context("mesh repair 缺少 target_thread")?;
                         self.repair_target_rollout(target_thread)?;
-                        self.upsert_link_thread(state, operation.link_index, &operation.winner_thread);
+                        self.upsert_link_thread(
+                            state,
+                            operation.link_index,
+                            &operation.winner_thread,
+                        );
                         self.upsert_link_thread(state, operation.link_index, target_thread);
                         self.touch_link_synced_at(state, operation.link_index);
                         upsert_session_index_entry(&mut session_index, target_thread)?;
-                        copy_workspace_hint(&mut global_state, &operation.winner_thread.id, &target_thread.id);
+                        copy_workspace_hint(
+                            &mut global_state,
+                            &operation.winner_thread.id,
+                            &target_thread.id,
+                        );
                         summary.repair += 1;
                     }
                 }
@@ -1204,7 +1443,10 @@ impl CodexSyncEngine {
                 for thread in &candidate.threads {
                     self.delete_thread_records(conn, &thread.id)?;
                     applied.thread_copies += 1;
-                    *applied.providers.entry(thread.model_provider.clone()).or_default() += 1;
+                    *applied
+                        .providers
+                        .entry(thread.model_provider.clone())
+                        .or_default() += 1;
                 }
             }
             Ok(())
@@ -1256,7 +1498,10 @@ impl CodexSyncEngine {
             conn.execute("delete from logs where thread_id=?", [thread_id])?;
         }
         if table_exists(conn, "thread_dynamic_tools")? {
-            conn.execute("delete from thread_dynamic_tools where thread_id=?", [thread_id])?;
+            conn.execute(
+                "delete from thread_dynamic_tools where thread_id=?",
+                [thread_id],
+            )?;
         }
         if table_exists(conn, "stage1_outputs")? {
             conn.execute("delete from stage1_outputs where thread_id=?", [thread_id])?;
@@ -1299,7 +1544,12 @@ impl CodexSyncEngine {
         target_thread: &ThreadRecord,
         target_provider: &str,
     ) -> ThreadRecord {
-        synced_target_thread(&self.codex_home, source_thread, target_thread, target_provider)
+        synced_target_thread(
+            &self.codex_home,
+            source_thread,
+            target_thread,
+            target_provider,
+        )
     }
 
     fn create_target_thread(
@@ -1310,12 +1560,8 @@ impl CodexSyncEngine {
     ) -> Result<ThreadRecord> {
         let source_id = source_thread.id.clone();
         let target_id = Uuid::new_v4().to_string();
-        let target_path = normalized_target_rollout_path(
-            &self.codex_home,
-            source_thread,
-            &source_id,
-            &target_id,
-        );
+        let target_path =
+            normalized_target_rollout_path(&self.codex_home, source_thread, &source_id, &target_id);
         if target_path.exists() {
             bail!("目标 rollout 已存在: {}", target_path.display());
         }
@@ -1381,7 +1627,8 @@ impl CodexSyncEngine {
         target_thread: &ThreadRecord,
         target_provider: &str,
     ) -> Result<()> {
-        let synced_thread = self.synced_target_thread(source_thread, target_thread, target_provider);
+        let synced_thread =
+            self.synced_target_thread(source_thread, target_thread, target_provider);
         let current_target_path = PathBuf::from(&target_thread.rollout_path);
         let target_path = PathBuf::from(&synced_thread.rollout_path);
         let source_rollout = fs::read_to_string(&source_thread.rollout_path)
@@ -1395,8 +1642,9 @@ impl CodexSyncEngine {
         )?;
         atomic_write_text(&target_path, &rewritten)?;
         if current_target_path != target_path && current_target_path.exists() {
-            fs::remove_file(&current_target_path)
-                .with_context(|| format!("删除旧 rollout 失败: {}", current_target_path.display()))?;
+            fs::remove_file(&current_target_path).with_context(|| {
+                format!("删除旧 rollout 失败: {}", current_target_path.display())
+            })?;
         }
 
         conn.execute(
@@ -1449,8 +1697,16 @@ impl CodexSyncEngine {
         Ok(())
     }
 
-    fn replace_auxiliary_tables(&self, conn: &Connection, source_id: &str, target_id: &str) -> Result<()> {
-        conn.execute("delete from thread_dynamic_tools where thread_id=?", [target_id])?;
+    fn replace_auxiliary_tables(
+        &self,
+        conn: &Connection,
+        source_id: &str,
+        target_id: &str,
+    ) -> Result<()> {
+        conn.execute(
+            "delete from thread_dynamic_tools where thread_id=?",
+            [target_id],
+        )?;
         conn.execute(
             "insert into thread_dynamic_tools (thread_id, position, name, description, input_schema, defer_loading) \
              select ?, position, name, description, input_schema, defer_loading from thread_dynamic_tools where thread_id=?",
@@ -1478,8 +1734,12 @@ impl CodexSyncEngine {
         if !self.session_index_path.exists() {
             return Ok(Vec::new());
         }
-        let content = fs::read_to_string(&self.session_index_path)
-            .with_context(|| format!("读取 session_index 失败: {}", self.session_index_path.display()))?;
+        let content = fs::read_to_string(&self.session_index_path).with_context(|| {
+            format!(
+                "读取 session_index 失败: {}",
+                self.session_index_path.display()
+            )
+        })?;
         let mut entries = Vec::new();
         for line in content.lines() {
             if line.trim().is_empty() {
@@ -1601,7 +1861,11 @@ pub fn rewrite_rollout_text(
     }
 
     if let Some(index) = last_turn_context_index {
-        let newline = if lines[index].ends_with('\n') { "\n" } else { "" };
+        let newline = if lines[index].ends_with('\n') {
+            "\n"
+        } else {
+            ""
+        };
         let trimmed = lines[index].trim_end_matches('\n');
         let mut turn_context: Value =
             serde_json::from_str(trimmed).context("turn_context 不是合法 JSON")?;
@@ -1620,7 +1884,11 @@ pub fn rewrite_rollout_text(
     Ok(lines.concat())
 }
 
-pub fn make_target_rollout_path(source_rollout_path: &str, source_thread_id: &str, target_thread_id: &str) -> PathBuf {
+pub fn make_target_rollout_path(
+    source_rollout_path: &str,
+    source_thread_id: &str,
+    target_thread_id: &str,
+) -> PathBuf {
     let source_path = Path::new(source_rollout_path);
     let stem = source_path
         .file_stem()
@@ -1648,11 +1916,19 @@ fn normalized_target_rollout_path(
     source_thread_id: &str,
     target_thread_id: &str,
 ) -> PathBuf {
-    let swapped_path = make_target_rollout_path(&source_thread.rollout_path, source_thread_id, target_thread_id);
+    let swapped_path = make_target_rollout_path(
+        &source_thread.rollout_path,
+        source_thread_id,
+        target_thread_id,
+    );
     let file_name = swapped_path
         .file_name()
         .map(|value| value.to_os_string())
-        .or_else(|| Path::new(&source_thread.rollout_path).file_name().map(|value| value.to_os_string()))
+        .or_else(|| {
+            Path::new(&source_thread.rollout_path)
+                .file_name()
+                .map(|value| value.to_os_string())
+        })
         .unwrap_or_else(|| std::ffi::OsString::from(format!("rollout-{target_thread_id}.jsonl")));
 
     if source_thread.archived != 0 {
@@ -1692,6 +1968,42 @@ fn ordered_active_providers(counts: &BTreeMap<String, i64>) -> Vec<String> {
     providers
 }
 
+fn resolve_selected_providers(
+    requested_providers: &[String],
+    counts: &BTreeMap<String, i64>,
+) -> Result<Vec<String>> {
+    let active_providers = ordered_active_providers(counts);
+    let mut requested = BTreeSet::new();
+    for provider in requested_providers {
+        let trimmed = provider.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        requested.insert(trimmed.to_string());
+    }
+
+    if requested.len() < 2 {
+        bail!("至少选择 2 个 provider");
+    }
+
+    let selected: Vec<_> = active_providers
+        .into_iter()
+        .filter(|provider| requested.contains(provider))
+        .collect();
+    let selected_set: BTreeSet<_> = selected.iter().cloned().collect();
+    let missing: Vec<_> = requested.difference(&selected_set).cloned().collect();
+
+    if !missing.is_empty() {
+        bail!("找不到有效 provider: {}", missing.join(", "));
+    }
+
+    if selected.len() < 2 {
+        bail!("至少选择 2 个有线程数据的 provider");
+    }
+
+    Ok(selected)
+}
+
 fn build_mesh_status_result(
     counts: BTreeMap<String, i64>,
     active_providers: Vec<String>,
@@ -1705,11 +2017,15 @@ fn build_mesh_status_result(
     let complete_link_count = if active_providers.is_empty() {
         0
     } else {
-        state.links.iter().filter(|link| {
-            active_providers
-                .iter()
-                .all(|provider| link.providers.contains_key(provider))
-        }).count() as i64
+        state
+            .links
+            .iter()
+            .filter(|link| {
+                active_providers
+                    .iter()
+                    .all(|provider| link.providers.contains_key(provider))
+            })
+            .count() as i64
     };
 
     MeshStatusResult {
@@ -1841,10 +2157,12 @@ fn collect_cleanup_candidates(
             .winner_thread
             .updated_at
             .cmp(&left.winner_thread.updated_at)
-            .then_with(|| preferred_provider_order(
-                &left.winner_thread.model_provider,
-                &right.winner_thread.model_provider,
-            ))
+            .then_with(|| {
+                preferred_provider_order(
+                    &left.winner_thread.model_provider,
+                    &right.winner_thread.model_provider,
+                )
+            })
             .then_with(|| left.winner_thread.id.cmp(&right.winner_thread.id))
     });
 
@@ -1876,7 +2194,10 @@ fn summarize_cleanup_candidates(candidates: &[CleanupCandidate]) -> CleanupSumma
         summary.logical_threads += 1;
         for thread in &candidate.threads {
             summary.thread_copies += 1;
-            *summary.providers.entry(thread.model_provider.clone()).or_default() += 1;
+            *summary
+                .providers
+                .entry(thread.model_provider.clone())
+                .or_default() += 1;
             match rollout_file_size(Path::new(&thread.rollout_path)).unwrap_or(None) {
                 Some(bytes) => summary.bytes += bytes,
                 None => summary.missing_rollouts += 1,
@@ -1943,7 +2264,9 @@ fn remove_thread_ids_from_global_state(state: &mut Value, deleted_ids: &BTreeSet
             }
         }
         Value::Array(items) => {
-            items.retain(|item| !matches!(item, Value::String(value) if deleted_ids.contains(value)));
+            items.retain(
+                |item| !matches!(item, Value::String(value) if deleted_ids.contains(value)),
+            );
             for item in items.iter_mut() {
                 remove_thread_ids_from_global_state(item, deleted_ids);
             }
@@ -1974,7 +2297,9 @@ fn rollout_file_size(path: &Path) -> Result<Option<i64>> {
     match fs::metadata(path) {
         Ok(metadata) => Ok(Some(metadata.len() as i64)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("读取 rollout 大小失败: {}", path.display())),
+        Err(error) => {
+            Err(error).with_context(|| format!("读取 rollout 大小失败: {}", path.display()))
+        }
     }
 }
 
@@ -2052,7 +2377,28 @@ fn select_authoritative_thread(
 ) -> Option<ThreadRecord> {
     link.providers
         .iter()
-        .filter_map(|(provider, thread_id)| threads.get(provider).and_then(|bucket| bucket.get(thread_id)))
+        .filter_map(|(provider, thread_id)| {
+            threads
+                .get(provider)
+                .and_then(|bucket| bucket.get(thread_id))
+        })
+        .cloned()
+        .max_by(compare_thread_authority)
+}
+
+fn select_authoritative_thread_for_providers(
+    link: &LinkEntry,
+    threads: &BTreeMap<String, BTreeMap<String, ThreadRecord>>,
+    selected_providers: &BTreeSet<String>,
+) -> Option<ThreadRecord> {
+    link.providers
+        .iter()
+        .filter(|(provider, _)| selected_providers.contains(*provider))
+        .filter_map(|(provider, thread_id)| {
+            threads
+                .get(provider)
+                .and_then(|bucket| bucket.get(thread_id))
+        })
         .cloned()
         .max_by(compare_thread_authority)
 }
@@ -2153,7 +2499,10 @@ fn clean_mesh_link(
     let mut rollout_paths = BTreeMap::new();
 
     for (provider, thread_id) in link.providers {
-        let Some(thread) = threads.get(&provider).and_then(|bucket| bucket.get(&thread_id)) else {
+        let Some(thread) = threads
+            .get(&provider)
+            .and_then(|bucket| bucket.get(&thread_id))
+        else {
             continue;
         };
         providers.insert(provider.clone(), thread_id);
@@ -2327,7 +2676,9 @@ fn merge_link_group(
     }
 
     {
-        let base = groups[base_index].as_mut().expect("base group should exist");
+        let base = groups[base_index]
+            .as_mut()
+            .expect("base group should exist");
         if track_adoption {
             for locator in &new_members {
                 if !base.providers.contains_key(&locator.provider) {
@@ -2341,7 +2692,9 @@ fn merge_link_group(
     for index in indices.into_iter().skip(1) {
         if let Some(other) = groups[index].take() {
             {
-                let base = groups[base_index].as_mut().expect("base group should exist");
+                let base = groups[base_index]
+                    .as_mut()
+                    .expect("base group should exist");
                 merge_link_entries(base, other.clone());
             }
             for (provider, thread_id) in other.providers {
@@ -2489,14 +2842,20 @@ fn match_unlinked_threads<F>(
         if used_a.contains(&thread.id) {
             continue;
         }
-        bucket_a.entry(make_key(thread)).or_default().push(thread.clone());
+        bucket_a
+            .entry(make_key(thread))
+            .or_default()
+            .push(thread.clone());
     }
 
     for thread in provider_b_threads.values() {
         if used_b.contains(&thread.id) {
             continue;
         }
-        bucket_b.entry(make_key(thread)).or_default().push(thread.clone());
+        bucket_b
+            .entry(make_key(thread))
+            .or_default()
+            .push(thread.clone());
     }
 
     let shared_keys: Vec<_> = bucket_a
@@ -2511,7 +2870,12 @@ fn match_unlinked_threads<F>(
         right.sort_by(|a, b| a.id.cmp(&b.id));
 
         for (source_thread, target_thread) in left.into_iter().zip(right.into_iter()) {
-            cleaned_links.push(make_link(provider_a, provider_b, &source_thread, &target_thread));
+            cleaned_links.push(make_link(
+                provider_a,
+                provider_b,
+                &source_thread,
+                &target_thread,
+            ));
             used_a.insert(source_thread.id);
             used_b.insert(target_thread.id);
         }
@@ -2535,7 +2899,10 @@ fn match_unlinked_threads_by_signature(
             continue;
         }
         if let Some(signature) = make_rollout_signature(thread) {
-            signature_a.entry(signature).or_default().push(thread.clone());
+            signature_a
+                .entry(signature)
+                .or_default()
+                .push(thread.clone());
         }
     }
 
@@ -2544,7 +2911,10 @@ fn match_unlinked_threads_by_signature(
             continue;
         }
         if let Some(signature) = make_rollout_signature(thread) {
-            signature_b.entry(signature).or_default().push(thread.clone());
+            signature_b
+                .entry(signature)
+                .or_default()
+                .push(thread.clone());
         }
     }
 
@@ -2560,7 +2930,12 @@ fn match_unlinked_threads_by_signature(
         right.sort_by(|a, b| a.id.cmp(&b.id));
 
         for (source_thread, target_thread) in left.into_iter().zip(right.into_iter()) {
-            cleaned_links.push(make_link(provider_a, provider_b, &source_thread, &target_thread));
+            cleaned_links.push(make_link(
+                provider_a,
+                provider_b,
+                &source_thread,
+                &target_thread,
+            ));
             used_a.insert(source_thread.id);
             used_b.insert(target_thread.id);
         }
@@ -2646,14 +3021,10 @@ fn atomic_write_text(path: &Path, content: &str) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("创建目录失败: {}", parent.display()))?;
     }
-    let temp_path = path.with_extension(format!(
-        "{}.tmp",
-        Uuid::new_v4().simple()
-    ));
+    let temp_path = path.with_extension(format!("{}.tmp", Uuid::new_v4().simple()));
     fs::write(&temp_path, content.as_bytes())
         .with_context(|| format!("写入临时文件失败: {}", temp_path.display()))?;
-    fs::rename(&temp_path, path)
-        .with_context(|| format!("原子替换失败: {}", path.display()))?;
+    fs::rename(&temp_path, path).with_context(|| format!("原子替换失败: {}", path.display()))?;
     Ok(())
 }
 
@@ -2664,8 +3035,8 @@ where
     if !path.exists() {
         return Ok(default);
     }
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("读取 JSON 失败: {}", path.display()))?;
+    let content =
+        fs::read_to_string(path).with_context(|| format!("读取 JSON 失败: {}", path.display()))?;
     Ok(serde_json::from_str(&content)?)
 }
 
@@ -2699,7 +3070,9 @@ fn rollout_permissions_match(thread: &ThreadRecord) -> bool {
         Ok(value) => value,
         Err(_) => return true,
     };
-    let Some((actual_sandbox, actual_approval)) = latest_turn_context(Path::new(&thread.rollout_path)) else {
+    let Some((actual_sandbox, actual_approval)) =
+        latest_turn_context(Path::new(&thread.rollout_path))
+    else {
         return true;
     };
     actual_approval == thread.approval_mode && actual_sandbox == expected_sandbox
@@ -2763,7 +3136,10 @@ fn upsert_session_index_entry(entries: &mut Vec<Value>, thread: &ThreadRecord) -
             let object = entry
                 .as_object_mut()
                 .ok_or_else(|| anyhow!("session_index 条目不是对象"))?;
-            object.insert("thread_name".to_string(), Value::String(thread.title.clone()));
+            object.insert(
+                "thread_name".to_string(),
+                Value::String(thread.title.clone()),
+            );
             object.insert("updated_at".to_string(), Value::String(updated_at));
             return Ok(());
         }
@@ -2878,7 +3254,9 @@ mod tests {
         }
     }
 
-    fn sample_threads_by_provider(threads: Vec<ThreadRecord>) -> BTreeMap<String, BTreeMap<String, ThreadRecord>> {
+    fn sample_threads_by_provider(
+        threads: Vec<ThreadRecord>,
+    ) -> BTreeMap<String, BTreeMap<String, ThreadRecord>> {
         let mut providers = BTreeMap::new();
         for thread in threads {
             providers
@@ -3058,7 +3436,10 @@ mod tests {
             "never",
         )
         .expect("rewrite should succeed");
-        let latest_line = rewritten.lines().last().expect("turn context line should exist");
+        let latest_line = rewritten
+            .lines()
+            .last()
+            .expect("turn context line should exist");
         assert!(latest_line.contains("\"approval_policy\":\"never\""));
         assert!(latest_line.contains("\"sandbox_policy\":{\"type\":\"danger-full-access\"}"));
     }
@@ -3089,17 +3470,19 @@ mod tests {
         );
 
         assert_eq!(result.links.len(), 1);
-        assert_eq!(result.links[0].providers.get("openai"), Some(&"a1".to_string()));
-        assert_eq!(result.links[0].providers.get("cpa"), Some(&"b1".to_string()));
+        assert_eq!(
+            result.links[0].providers.get("openai"),
+            Some(&"a1".to_string())
+        );
+        assert_eq!(
+            result.links[0].providers.get("cpa"),
+            Some(&"b1".to_string())
+        );
     }
 
     #[test]
     fn make_target_rollout_path_replaces_suffix_id() {
-        let target = make_target_rollout_path(
-            "/tmp/rollout-old-id.jsonl",
-            "old-id",
-            "new-id",
-        );
+        let target = make_target_rollout_path("/tmp/rollout-old-id.jsonl", "old-id", "new-id");
         assert_eq!(target, PathBuf::from("/tmp/rollout-new-id.jsonl"));
     }
 
@@ -3123,8 +3506,13 @@ mod tests {
         let openai = sample_thread("a1", "openai", "/tmp/a1.jsonl");
         let cpa = sample_thread("b1", "cpa", "/tmp/b1.jsonl");
         let anthropic = sample_thread("c1", "anthropic", "/tmp/c1.jsonl");
-        let threads = sample_threads_by_provider(vec![openai.clone(), cpa.clone(), anthropic.clone()]);
-        let providers = vec!["openai".to_string(), "cpa".to_string(), "anthropic".to_string()];
+        let threads =
+            sample_threads_by_provider(vec![openai.clone(), cpa.clone(), anthropic.clone()]);
+        let providers = vec![
+            "openai".to_string(),
+            "cpa".to_string(),
+            "anthropic".to_string(),
+        ];
         let existing_state = SyncState {
             version: 1,
             links: vec![make_link("openai", "cpa", &openai, &cpa)],
@@ -3160,13 +3548,75 @@ mod tests {
     }
 
     #[test]
+    fn select_authoritative_thread_for_selected_providers_ignores_unselected_provider() {
+        let mut openai = sample_thread("a1", "openai", "/tmp/a1.jsonl");
+        let mut cpa = sample_thread("b1", "cpa", "/tmp/b1.jsonl");
+        let mut anthropic = sample_thread("c1", "anthropic", "/tmp/c1.jsonl");
+        openai.updated_at = 10;
+        cpa.updated_at = 10;
+        anthropic.updated_at = 100;
+        let threads =
+            sample_threads_by_provider(vec![openai.clone(), cpa.clone(), anthropic.clone()]);
+        let link = LinkEntry {
+            providers: BTreeMap::from([
+                ("openai".to_string(), openai.id.clone()),
+                ("cpa".to_string(), cpa.id.clone()),
+                ("anthropic".to_string(), anthropic.id.clone()),
+            ]),
+            rollout_paths: BTreeMap::new(),
+            last_synced_at: None,
+            extra: BTreeMap::new(),
+        };
+        let selected = BTreeSet::from(["openai".to_string(), "cpa".to_string()]);
+
+        let winner = select_authoritative_thread_for_providers(&link, &threads, &selected)
+            .expect("winner should exist");
+
+        assert_eq!(winner.model_provider, "openai");
+        assert_eq!(winner.id, "a1");
+    }
+
+    #[test]
+    fn resolve_selected_providers_preserves_preferred_order() {
+        let counts = BTreeMap::from([
+            ("anthropic".to_string(), 2),
+            ("cpa".to_string(), 1),
+            ("openai".to_string(), 3),
+        ]);
+
+        let selected = resolve_selected_providers(
+            &[
+                "anthropic".to_string(),
+                "openai".to_string(),
+                "cpa".to_string(),
+            ],
+            &counts,
+        )
+        .expect("selected providers should resolve");
+
+        assert_eq!(
+            selected,
+            vec![
+                "openai".to_string(),
+                "cpa".to_string(),
+                "anthropic".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn plan_mesh_operations_marks_adopt_for_existing_new_provider_thread() {
         let engine = sample_engine();
         let openai = sample_thread("a1", "openai", "/tmp/a1.jsonl");
         let cpa = sample_thread("b1", "cpa", "/tmp/b1.jsonl");
         let anthropic = sample_thread("c1", "anthropic", "/tmp/c1.jsonl");
-        let threads = sample_threads_by_provider(vec![openai.clone(), cpa.clone(), anthropic.clone()]);
-        let providers = vec!["openai".to_string(), "cpa".to_string(), "anthropic".to_string()];
+        let threads =
+            sample_threads_by_provider(vec![openai.clone(), cpa.clone(), anthropic.clone()]);
+        let providers = vec![
+            "openai".to_string(),
+            "cpa".to_string(),
+            "anthropic".to_string(),
+        ];
         let state = SyncState {
             version: 1,
             links: vec![make_link("openai", "cpa", &openai, &cpa)],
@@ -3174,12 +3624,8 @@ mod tests {
         };
 
         let bootstrap = build_mesh_links_state(state, &threads, &providers);
-        let operations = engine.plan_mesh_operations(
-            &bootstrap.state,
-            &threads,
-            &providers,
-            &bootstrap.adopted,
-        );
+        let operations =
+            engine.plan_mesh_operations(&bootstrap.state, &threads, &providers, &bootstrap.adopted);
 
         let adopt = operations
             .iter()
@@ -3205,12 +3651,8 @@ mod tests {
             extra: BTreeMap::new(),
         };
 
-        let operations = engine.plan_mesh_operations(
-            &state,
-            &threads,
-            &providers,
-            &BTreeSet::new(),
-        );
+        let operations =
+            engine.plan_mesh_operations(&state, &threads, &providers, &BTreeSet::new());
 
         let cpa_op = operations
             .iter()
@@ -3266,12 +3708,8 @@ mod tests {
             extra: BTreeMap::new(),
         };
 
-        let operations = engine.plan_mesh_operations(
-            &state,
-            &threads,
-            &providers,
-            &BTreeSet::new(),
-        );
+        let operations =
+            engine.plan_mesh_operations(&state, &threads, &providers, &BTreeSet::new());
 
         let cpa_op = operations
             .iter()
@@ -3420,7 +3858,10 @@ mod tests {
             .cleanup("archived", Some(1), 0, true)
             .expect("apply cleanup should succeed");
         assert_eq!(
-            applied.applied.expect("applied summary should exist").thread_copies,
+            applied
+                .applied
+                .expect("applied summary should exist")
+                .thread_copies,
             2
         );
 
@@ -3435,7 +3876,9 @@ mod tests {
             .query_row("select count(*) from stage1_outputs", [], |row| row.get(0))
             .expect("count stage1");
         let tool_count: i64 = conn
-            .query_row("select count(*) from thread_dynamic_tools", [], |row| row.get(0))
+            .query_row("select count(*) from thread_dynamic_tools", [], |row| {
+                row.get(0)
+            })
             .expect("count tools");
         let assigned_thread: Option<String> = conn
             .query_row(
@@ -3460,9 +3903,11 @@ mod tests {
         )
         .expect("load state");
         assert!(state.links.is_empty());
-        let session_index = fs::read_to_string(&engine.session_index_path).expect("read session index");
+        let session_index =
+            fs::read_to_string(&engine.session_index_path).expect("read session index");
         assert!(session_index.trim().is_empty());
-        let global_state = fs::read_to_string(&engine.global_state_path).expect("read global state");
+        let global_state =
+            fs::read_to_string(&engine.global_state_path).expect("read global state");
         assert_eq!(global_state.trim(), "{}");
         assert!(!Path::new(&openai.rollout_path).exists());
         assert!(!Path::new(&cpa.rollout_path).exists());

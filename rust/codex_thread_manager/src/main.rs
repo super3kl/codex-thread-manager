@@ -71,6 +71,13 @@ enum Command {
         #[arg(long, default_value_t = false)]
         dry_run: bool,
     },
+    #[command(name = "sync-selected")]
+    SyncSelected {
+        #[arg(long = "provider", required = true, num_args = 1.., value_delimiter = ',')]
+        providers: Vec<String>,
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
     Cleanup {
         #[arg(long, value_enum, default_value_t = CleanupScopeArg::Archived)]
         scope: CleanupScopeArg,
@@ -96,14 +103,18 @@ fn main() -> std::process::ExitCode {
         Command::Status {
             provider_a,
             provider_b,
-        } => engine.status(&provider_a, &provider_b).map(|result| json!(result)),
+        } => engine
+            .status(&provider_a, &provider_b)
+            .map(|result| json!(result)),
         Command::StatusAll => engine.status_all().map(|result| json!(result)),
         Command::Space => engine.space().map(|result| json!(result)),
         Command::Sync {
             source,
             target,
             dry_run,
-        } => engine.sync(&source, &target, dry_run).map(|result| json!(result)),
+        } => engine
+            .sync(&source, &target, dry_run)
+            .map(|result| json!(result)),
         Command::SyncBidirectional {
             provider_a,
             provider_b,
@@ -112,6 +123,9 @@ fn main() -> std::process::ExitCode {
             .sync_bidirectional(&provider_a, &provider_b, dry_run)
             .map(|result| json!(result)),
         Command::SyncAll { dry_run } => engine.sync_all(dry_run).map(|result| json!(result)),
+        Command::SyncSelected { providers, dry_run } => engine
+            .sync_selected(&providers, dry_run)
+            .map(|result| json!(result)),
         Command::Cleanup {
             scope,
             older_than_days,

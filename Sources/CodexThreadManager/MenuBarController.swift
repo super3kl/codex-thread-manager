@@ -17,6 +17,14 @@ private struct ScriptEnvelope<T: Decodable>: Decodable {
     let error: String?
 }
 
+private final class CompletionRelay<Value>: @unchecked Sendable {
+    let completion: (Value) -> Void
+
+    init(_ completion: @escaping (Value) -> Void) {
+        self.completion = completion
+    }
+}
+
 private struct StatusPaths: Decodable {
     let codexHome: String
     let statePath: String
@@ -53,50 +61,6 @@ private struct AppliedSummary: Decodable {
     let update: Int
     let repair: Int
     let skip: Int
-}
-
-private struct DirectionalResult: Decodable {
-    let mode: String
-    let source: String?
-    let target: String?
-    let planned: AppliedSummary?
-    let applied: AppliedSummary?
-    let backupDir: String?
-    let status: [String: Int]?
-
-    private enum CodingKeys: String, CodingKey {
-        case mode
-        case source
-        case target
-        case planned
-        case applied
-        case backupDir = "backup_dir"
-        case status
-    }
-}
-
-private struct BidirectionalResult: Decodable {
-    let mode: String
-    let runs: [DirectionalResult]
-    let finalStatus: StatusResult
-
-    private enum CodingKeys: String, CodingKey {
-        case mode
-        case runs
-        case finalStatus = "final_status"
-    }
-}
-
-private struct StatusResult: Decodable {
-    let providers: [String: Int]
-    let pairLinks: [String: Int]
-    let paths: StatusPaths
-
-    private enum CodingKeys: String, CodingKey {
-        case providers
-        case pairLinks = "pair_links"
-        case paths
-    }
 }
 
 private struct MeshSyncResult: Decodable {
@@ -203,20 +167,11 @@ private struct CleanupResult: Decodable {
 
 private enum SyncAction {
     case allProviders
-    case bidirectional
-    case openAIToCPA
-    case cPAToOpenAI
 
     var title: String {
         switch self {
         case .allProviders:
             return "同步全部 provider"
-        case .bidirectional:
-            return "双向同步 openai ⇄ cpa"
-        case .openAIToCPA:
-            return "同步 openai -> cpa"
-        case .cPAToOpenAI:
-            return "同步 cpa -> openai"
         }
     }
 
@@ -224,12 +179,6 @@ private enum SyncAction {
         switch self {
         case .allProviders:
             return ["sync-all"]
-        case .bidirectional:
-            return ["sync-bidirectional", "--provider-a", "openai", "--provider-b", "cpa"]
-        case .openAIToCPA:
-            return ["sync", "--source", "openai", "--target", "cpa"]
-        case .cPAToOpenAI:
-            return ["sync", "--source", "cpa", "--target", "openai"]
         }
     }
 }
@@ -252,9 +201,7 @@ final class MenuBarController: NSObject {
     )
     private let lastResultItem = NSMenuItem(title: "最近一次结果: 尚未执行", action: nil, keyEquivalent: "")
     private let syncAllItem = NSMenuItem(title: SyncAction.allProviders.title, action: #selector(syncAllProviders), keyEquivalent: "")
-    private let syncBothItem = NSMenuItem(title: SyncAction.bidirectional.title, action: #selector(syncBoth), keyEquivalent: "")
-    private let syncOpenAIToCPAItem = NSMenuItem(title: SyncAction.openAIToCPA.title, action: #selector(syncOpenAIToCPA), keyEquivalent: "")
-    private let syncCPAToOpenAIItem = NSMenuItem(title: SyncAction.cPAToOpenAI.title, action: #selector(syncCPAToOpenAI), keyEquivalent: "")
+    private let syncSelectedProvidersItem = NSMenuItem(title: "同步指定 provider...", action: #selector(syncSelectedProviders), keyEquivalent: "")
     private let cleanupSettingsItem = NSMenuItem(title: "清理设置...", action: #selector(openCleanupSettings), keyEquivalent: "")
     private let cleanupArchivedItem = NSMenuItem(
         title: "清理已归档线程...",
@@ -305,9 +252,7 @@ final class MenuBarController: NSObject {
         lastResultItem.isEnabled = false
 
         syncAllItem.target = self
-        syncBothItem.target = self
-        syncOpenAIToCPAItem.target = self
-        syncCPAToOpenAIItem.target = self
+        syncSelectedProvidersItem.target = self
         cleanupSettingsItem.target = self
         cleanupArchivedItem.target = self
         refreshItem.target = self
@@ -325,9 +270,7 @@ final class MenuBarController: NSObject {
         menu.addItem(lastResultItem)
         menu.addItem(.separator())
         menu.addItem(syncAllItem)
-        menu.addItem(syncBothItem)
-        menu.addItem(syncOpenAIToCPAItem)
-        menu.addItem(syncCPAToOpenAIItem)
+        menu.addItem(syncSelectedProvidersItem)
         menu.addItem(cleanupSettingsItem)
         menu.addItem(cleanupArchivedItem)
         menu.addItem(.separator())
@@ -371,18 +314,40 @@ final class MenuBarController: NSObject {
     }
 
     @objc
-    private func syncBoth() {
-        performSync(.bidirectional)
-    }
+    private func syncSelectedProviders() {
+        guard !isRunningSync else { return }
 
-    @objc
-    private func syncOpenAIToCPA() {
-        performSync(.openAIToCPA)
-    }
+        let providers = selectableProviders()
+        guard providers.count >= 2 else {
+            showError("可同步的 provider 不足", error: "至少需要 2 个 provider 才能执行同步。")
+            return
+        }
 
-    @objc
-    private func syncCPAToOpenAI() {
-        performSync(.cPAToOpenAI)
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "选择要同步的 provider"
+        alert.informativeText = "默认会勾选全部 provider。至少选择 2 个后才能开始同步。"
+
+        let checkboxes = providers.map { provider, count -> NSButton in
+            let button = NSButton(checkboxWithTitle: "\(provider) (\(count))", target: nil, action: nil)
+            button.state = .on
+            return button
+        }
+        alert.accessoryView = makeProviderSelectionView(checkboxes: checkboxes)
+        alert.addButton(withTitle: "开始同步")
+        alert.addButton(withTitle: "取消")
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let selectedProviders = zip(providers, checkboxes).compactMap { entry, checkbox in
+            checkbox.state == .on ? entry.0 : nil
+        }
+        guard selectedProviders.count >= 2 else {
+            showError("选择无效", error: "请至少勾选 2 个 provider。")
+            return
+        }
+
+        performSelectedProviderSync(selectedProviders)
     }
 
     @objc
@@ -533,63 +498,42 @@ final class MenuBarController: NSObject {
         updateActionAvailability()
         setStatusIconSyncing()
 
-        switch action {
-        case .allProviders:
-            runSyncBinary(arguments: action.arguments) { [weak self] (result: Result<MeshSyncResult, Error>) in
-                self?.handleMeshResult(result)
-            }
-        case .bidirectional:
-            runSyncBinary(arguments: action.arguments) { [weak self] (result: Result<BidirectionalResult, Error>) in
-                self?.handleBidirectionalResult(result)
-            }
-        case .openAIToCPA, .cPAToOpenAI:
-            runSyncBinary(arguments: action.arguments) { [weak self] (result: Result<DirectionalResult, Error>) in
-                self?.handleDirectionalResult(result, title: action.title)
-            }
+        runSyncBinary(arguments: action.arguments) { [weak self] (result: Result<MeshSyncResult, Error>) in
+            self?.handleMeshResult(result)
         }
     }
 
-    private func handleMeshResult(_ result: Result<MeshSyncResult, Error>) {
+    private func performSelectedProviderSync(_ providers: [String]) {
+        guard !isRunningSync else { return }
+        let description = providerListDescription(providers)
+        isRunningSync = true
+        lastResultItem.title = "最近一次结果: 正在同步 \(description)"
+        updateActionAvailability()
+        setStatusIconSyncing()
+
+        runSyncBinary(arguments: selectedProviderArguments(providers: providers)) { [weak self] (result: Result<MeshSyncResult, Error>) in
+            self?.handleMeshResult(result, actionTitle: "同步指定 provider", failureTitle: "同步指定 provider 失败")
+        }
+    }
+
+    private func handleMeshResult(
+        _ result: Result<MeshSyncResult, Error>,
+        actionTitle: String = "同步全部 provider",
+        failureTitle: String = "同步全部 provider 失败"
+    ) {
         defer { finishSync() }
         switch result {
         case .success(let summary):
             let applied = summary.applied
-            lastResultItem.title = "最近一次结果: 全量同步 p\(summary.providers.count) c\(applied?.create ?? 0) a\(applied?.adopt ?? 0) u\(applied?.update ?? 0) r\(applied?.repair ?? 0)"
+            let titlePrefix = summary.mode == "mesh-selected"
+                ? "指定同步 \(providerListDescription(summary.providers))"
+                : "全量同步 p\(summary.providers.count)"
+            lastResultItem.title = "最近一次结果: \(titlePrefix) c\(applied?.create ?? 0) a\(applied?.adopt ?? 0) u\(applied?.update ?? 0) r\(applied?.repair ?? 0)"
             applyMeshStatus(summary.finalStatus)
             refreshSpaceStatus(showError: false)
         case .failure(let error):
-            lastResultItem.title = "最近一次结果: 全量同步失败"
-            showError("同步全部 provider 失败", error: error.localizedDescription)
-        }
-    }
-
-    private func handleDirectionalResult(_ result: Result<DirectionalResult, Error>, title: String) {
-        defer { finishSync() }
-        switch result {
-        case .success(let summary):
-            let applied = summary.applied
-            lastResultItem.title = "最近一次结果: \(title) c\(applied?.create ?? 0) a\(applied?.adopt ?? 0) u\(applied?.update ?? 0) r\(applied?.repair ?? 0)"
-            refreshStatus()
-        case .failure(let error):
-            lastResultItem.title = "最近一次结果: \(title) 失败"
-            showError("同步失败", error: error.localizedDescription)
-        }
-    }
-
-    private func handleBidirectionalResult(_ result: Result<BidirectionalResult, Error>) {
-        defer { finishSync() }
-        switch result {
-        case .success(let summary):
-            let description = summary.runs.compactMap { run -> String? in
-                guard let source = run.source, let target = run.target else { return nil }
-                let applied = run.applied
-                return "\(source)->\(target): c\(applied?.create ?? 0) a\(applied?.adopt ?? 0) u\(applied?.update ?? 0) r\(applied?.repair ?? 0)"
-            }.joined(separator: " | ")
-            lastResultItem.title = "最近一次结果: \(description)"
-            refreshStatus()
-        case .failure(let error):
-            lastResultItem.title = "最近一次结果: 双向同步失败"
-            showError("双向同步失败", error: error.localizedDescription)
+            lastResultItem.title = "最近一次结果: \(actionTitle) 失败"
+            showError(failureTitle, error: error.localizedDescription)
         }
     }
 
@@ -657,12 +601,15 @@ final class MenuBarController: NSObject {
         }
     }
 
-    private func finishSync() {
+    private func finishSync(refreshStatus shouldRefreshStatus: Bool = false) {
         isRunningSync = false
         updateActionAvailability()
         if let button = statusItem.button {
             button.image = StatusIcon.make(state: .idle)
             button.toolTip = "Codex Thread Manager"
+        }
+        if shouldRefreshStatus {
+            refreshStatus()
         }
     }
 
@@ -676,19 +623,35 @@ final class MenuBarController: NSObject {
     private func updateActionAvailability() {
         let enabled = !isRunningSync
         let providers = latestStatus?.providerOrder ?? []
-        let providerSet = Set(providers)
         let hasAtLeastTwoProviders = providers.count >= 2
-        let hasOpenAIAndCPA = providerSet.contains("openai") && providerSet.contains("cpa")
         let hasArchivedThreads = (latestSpace?.archived.threadCopies ?? 0) > 0
         let hasValidCleanupRule = self.hasValidCleanupRule
 
         syncAllItem.isEnabled = enabled && hasAtLeastTwoProviders
-        syncBothItem.isEnabled = enabled && hasOpenAIAndCPA
-        syncOpenAIToCPAItem.isEnabled = enabled && hasOpenAIAndCPA
-        syncCPAToOpenAIItem.isEnabled = enabled && hasOpenAIAndCPA
+        syncSelectedProvidersItem.isEnabled = enabled && hasAtLeastTwoProviders
         cleanupSettingsItem.isEnabled = enabled
         cleanupArchivedItem.isEnabled = enabled && hasArchivedThreads && hasValidCleanupRule
         refreshItem.isEnabled = enabled
+    }
+
+    private func selectableProviders() -> [(String, Int)] {
+        guard let status = latestStatus else { return [] }
+        let order = status.providerOrder.isEmpty ? status.providers.keys.sorted() : status.providerOrder
+        return order.map { provider in
+            (provider, status.providers[provider, default: 0])
+        }
+    }
+
+    private func selectedProviderArguments(providers: [String]) -> [String] {
+        var arguments = ["sync-selected"]
+        for provider in providers {
+            arguments.append(contentsOf: ["--provider", provider])
+        }
+        return arguments
+    }
+
+    private func providerListDescription(_ providers: [String]) -> String {
+        providers.joined(separator: " | ")
     }
 
     private func cleanupArguments(apply: Bool) -> [String] {
@@ -856,6 +819,31 @@ final class MenuBarController: NSObject {
         return group
     }
 
+    private func makeProviderSelectionView(checkboxes: [NSButton]) -> NSView {
+        let hint = NSTextField(wrappingLabelWithString: "至少选择 2 个 provider。默认会同步当前勾选的全部项。")
+        hint.textColor = .secondaryLabelColor
+        hint.maximumNumberOfLines = 0
+
+        let contentViews = checkboxes.map { $0 as NSView } + [hint as NSView]
+        let container = NSStackView(views: contentViews)
+        container.orientation = .vertical
+        container.alignment = .leading
+        container.spacing = 8
+        container.edgeInsets = NSEdgeInsets(top: 2, left: 0, bottom: 2, right: 0)
+        container.translatesAutoresizingMaskIntoConstraints = false
+
+        let height = max(CGFloat(140), CGFloat((checkboxes.count * 28) + 48))
+        let wrapper = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: height))
+        wrapper.addSubview(container)
+        NSLayoutConstraint.activate([
+            container.leadingAnchor.constraint(equalTo: wrapper.leadingAnchor),
+            container.trailingAnchor.constraint(equalTo: wrapper.trailingAnchor),
+            container.topAnchor.constraint(equalTo: wrapper.topAnchor),
+            container.bottomAnchor.constraint(equalTo: wrapper.bottomAnchor),
+        ])
+        return wrapper
+    }
+
     private func runSyncBinary<T: Decodable>(arguments: [String], completion: @escaping (Result<T, Error>) -> Void) {
         guard let binaryURL = ScriptLocator.locate() else {
             completion(.failure(NSError(domain: "CodexThreadManager", code: 1, userInfo: [
@@ -863,6 +851,8 @@ final class MenuBarController: NSObject {
             ])))
             return
         }
+
+        let completionRelay = CompletionRelay<Result<T, Error>>(completion)
 
         let process = Process()
         process.executableURL = binaryURL
@@ -883,7 +873,7 @@ final class MenuBarController: NSObject {
 
                 guard process.terminationStatus == 0 else {
                     DispatchQueue.main.async {
-                        completion(.failure(NSError(domain: "CodexThreadManager", code: Int(process.terminationStatus), userInfo: [
+                        completionRelay.completion(.failure(NSError(domain: "CodexThreadManager", code: Int(process.terminationStatus), userInfo: [
                             NSLocalizedDescriptionKey: errorOutput.isEmpty ? output : errorOutput,
                         ])))
                     }
@@ -893,18 +883,18 @@ final class MenuBarController: NSObject {
                 let envelope = try JSONDecoder().decode(ScriptEnvelope<T>.self, from: Data(output.utf8))
                 if envelope.ok, let result = envelope.result {
                     DispatchQueue.main.async {
-                        completion(.success(result))
+                        completionRelay.completion(.success(result))
                     }
                 } else {
                     DispatchQueue.main.async {
-                        completion(.failure(NSError(domain: "CodexThreadManager", code: 2, userInfo: [
+                        completionRelay.completion(.failure(NSError(domain: "CodexThreadManager", code: 2, userInfo: [
                             NSLocalizedDescriptionKey: envelope.error ?? "未知错误",
                         ])))
                     }
                 }
             } catch {
                 DispatchQueue.main.async {
-                    completion(.failure(error))
+                    completionRelay.completion(.failure(error))
                 }
             }
         }
